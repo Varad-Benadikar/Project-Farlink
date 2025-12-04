@@ -3,7 +3,7 @@ Pin Connections :
    - Red : 15 + GND
    - Blue : 4 + GND
    - Green : 2 + GND
-2. LCD :
+2. LCD 16x2 :
    - VCC : Vin
    - GND : GND
    - SDA : 21
