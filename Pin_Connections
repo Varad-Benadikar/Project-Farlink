@@ -1,0 +1,20 @@
+Pin Connections :
+1. LEDs :
+   - Red : 15 + GND
+   - Blue : 4 + GND
+   - Green : 2 + GND
+2. LCD :
+   - VCC : Vin
+   - GND : GND
+   - SDA : 21
+   - SCL : 22
+3. 4x4 Keypad :
+   - C1 : 32
+   - C2 : 33
+   - C3 : 25
+   - C4 : 26
+   - R1 : 27
+   - R2 : 14
+   - R3 : 12
+   - R4 : 13
+4. Buzzer : 5 + GND
