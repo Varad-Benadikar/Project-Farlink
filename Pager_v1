@@ -1,0 +1,599 @@
+/* ESP32 Pager — UI fixes: menu clear, reliable marquee, inbox cursor
+   - TLS quick-test / HiveMQ support kept (set USE_TLS true for TLS)
+   - No LittleFS / no AP mode
+   - Edit DEFAULT_* before flashing
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
+// ---------- Hardware ----------
+#define LCD_ADDR 0x27
+#define LCD_COLS 16
+#define LCD_ROWS 2
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
+
+const byte ROWS = 4;
+const byte COLS = 4;
+char keysArr[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {32, 33, 25, 26};
+byte colPins[COLS] = {27, 14, 12, 13};
+Keypad keypad = Keypad(makeKeymap(keysArr), rowPins, colPins, ROWS, COLS);
+
+const int LED_CONN   = 2;
+const int LED_ERR    = 15;
+const int LED_NOTIF  = 4;
+const int BUZZER_PIN = 5;
+
+// ---------- App config ----------
+const int MAX_MESSAGES = 50;
+String mqttTopic = "pager/chat";
+String mqttBroker = "";
+int mqttPort = 8883;
+String deviceName = "ESP_1";
+
+const unsigned long WIFI_CHECK_MS = 60000UL;
+unsigned long lastWifiCheck = 0;
+
+const unsigned long MARQUEE_PAUSE_MS = 3000UL;
+const unsigned long MARQUEE_STEP_MS  = 300UL;
+const int SENDER_WIDTH = 7;           // when NOT in INBOX (no marker)
+const unsigned long MULTITAP_TIMEOUT_MS = 800UL;
+
+// ---------- Network objects ----------
+WiFiClient plainClient;
+WiFiClientSecure secureClient;
+PubSubClient mqttClient(plainClient);
+
+// ---------- Message buffer ----------
+struct Message {
+  String sender;
+  String body;
+  String ts;
+  bool unread;
+};
+Message msgBuf[MAX_MESSAGES];
+int msgHead = 0;
+int msgCount = 0;
+
+// ---------- State ----------
+enum State { HOME, INBOX, COMPOSE } state = HOME;
+int inboxCursor = 0;
+
+String composeBuf = "";
+int composeVisibleStart = 0;
+
+bool multiTapActive = false;
+char lastKey = 0;
+unsigned long lastKeyTime = 0;
+int multiTapStage = 0;
+String currentCharOptions = "";
+
+bool lastWifiConnected = false;
+bool lastMqttConnected = false;
+
+// ---------- === EDIT CREDENTIALS BEFORE FLASHING ===
+const char *DEFAULT_SSID   = "<WIFI_SSID>";
+const char *DEFAULT_WPASS  = "<PASSWORD>";
+const char *DEFAULT_BROKER = "<BROKER_LINK>";
+const int   DEFAULT_PORT   = 8883;
+const char *DEFAULT_TOPIC  = "<TOPIC>";
+const char *DEFAULT_MUSER  = "<USERNAME>";
+const char *DEFAULT_MPASS  = "<PASSWORD>";
+const char *DEFAULT_DNAME  = "<DEVICE_NAME>";
+const bool USE_TLS = true; // set to true for HiveMQ Cloud TLS (quick-test insecure)
+// ------------------------------------------------------
+
+// ---------- Forward declarations ----------
+void drawComposeBottom();
+void drawTopRowMarqueeForCursor();
+void mqttReconnect();
+const char* mqttStateName(int s);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void handleMultiTapKey(char k);
+void checkMultiTapTimeout();
+void drawHome();
+void storeMessageRAM(const Message &m);
+int circSlotForCursor(int cursor);
+bool loadMessageByCursor(int cursor, Message &out);
+
+// ---------- Utilities ----------
+String nowTimestamp(){
+  unsigned long s = millis()/1000;
+  unsigned long hh=(s/3600)%24, mm=(s/60)%60, ss=s%60;
+  char b[16]; snprintf(b,sizeof(b),"%02lu:%02lu:%02lu",hh,mm,ss);
+  return String(b);
+}
+void beep(int f,int d,int p=30){ tone(BUZZER_PIN,f,d); delay(d+p); noTone(BUZZER_PIN); }
+void playBuzzerPattern(uint8_t id){
+  if(id==0){ beep(2000,60,60); beep(2000,60,0); }
+  else if(id==1){ beep(3000,100,0); }
+  else if(id==2){ beep(800,220,0); }
+}
+
+// ---------- Message RAM ----------
+void storeMessageRAM(const Message &m){
+  msgBuf[msgHead]=m;
+  msgHead=(msgHead+1)%MAX_MESSAGES;
+  if(msgCount<MAX_MESSAGES) msgCount++;
+  inboxCursor = 0;
+}
+int circSlotForCursor(int cursor){
+  if(msgCount<=0) return -1;
+  int newest=(msgHead-1+MAX_MESSAGES)%MAX_MESSAGES;
+  return (newest - cursor + MAX_MESSAGES) % MAX_MESSAGES;
+}
+bool loadMessageByCursor(int cursor, Message &out){
+  int s = circSlotForCursor(cursor);
+  if(s<0) return false;
+  out = msgBuf[s];
+  return true;
+}
+
+// ---------- Multi-tap uppercase ----------
+String multiTapOptionsForKey(char k){
+  switch(k){
+    case '1': return "1.,?!";
+    case '2': return "2ABC";
+    case '3': return "3DEF";
+    case '4': return "4GHI";
+    case '5': return "5JKL";
+    case '6': return "6MNO";
+    case '7': return "7PQRS";
+    case '8': return "8TUV";
+    case '9': return "9WXYZ";
+    case '0': return "0 ";
+    case '#': return " ";
+    default: return String(k);
+  }
+}
+void commitMultiTapChar(){
+  if(!multiTapActive) return;
+  multiTapActive=false; lastKey=0; multiTapStage=0; currentCharOptions="";
+  if(composeBuf.length()>LCD_COLS) composeVisibleStart=composeBuf.length()-LCD_COLS; else composeVisibleStart=0;
+}
+void handleMultiTapKey(char k){
+  if(k=='#'){ if(multiTapActive) commitMultiTapChar(); composeBuf += ' '; drawComposeBottom(); return; }
+  String opts = multiTapOptionsForKey(k);
+  unsigned long now = millis();
+  if(multiTapActive && lastKey==k && (now - lastKeyTime) < MULTITAP_TIMEOUT_MS){
+    multiTapStage++;
+    if(multiTapStage >= (int)currentCharOptions.length()) multiTapStage = 0;
+    if(composeBuf.length() > 0) composeBuf.remove(composeBuf.length()-1);
+    composeBuf += currentCharOptions.charAt(multiTapStage);
+    lastKeyTime = now;
+    drawComposeBottom();
+  } else {
+    if(multiTapActive) commitMultiTapChar();
+    currentCharOptions = opts;
+    multiTapStage = 0;
+    composeBuf += currentCharOptions.charAt(multiTapStage);
+    multiTapActive = true;
+    lastKey = k;
+    lastKeyTime = now;
+    if(composeBuf.length() > LCD_COLS) composeVisibleStart = composeBuf.length() - LCD_COLS;
+    drawComposeBottom();
+  }
+}
+void checkMultiTapTimeout(){
+  if(!multiTapActive) return;
+  if((millis() - lastKeyTime) >= MULTITAP_TIMEOUT_MS){
+    commitMultiTapChar();
+    drawComposeBottom();
+  }
+}
+
+// ---------- Display helpers ----------
+// Home draws greeting + live status; visible only in HOME
+void drawHome(){
+  state = HOME;
+  lcd.clear();
+  lcd.setCursor(0,0);
+  String top = "Hi " + deviceName + "!";
+  if(top.length() > LCD_COLS) top = top.substring(0, LCD_COLS);
+  lcd.print(top);
+  String bottom = "";
+  bottom += (WiFi.status() == WL_CONNECTED) ? "W:OK " : "W:-- ";
+  bottom += (mqttClient.connected() ? "M:OK " : "M:-- ");
+  bottom += "Msg:" + String(msgCount);
+  if(bottom.length() > LCD_COLS) bottom = bottom.substring(0, LCD_COLS);
+  lcd.setCursor(0,1); lcd.print(bottom);
+}
+
+// Top-row marquee for INBOX with selection marker '>' at col0
+void drawTopRowMarqueeForCursor(){
+  // Clear entire display first so residual lines (like menu) disappear
+  lcd.clear();
+
+  // If no messages: show friendly text on top and nothing below
+  if(msgCount <= 0){
+    lcd.setCursor(0,0); lcd.print("No messages     ");
+    lcd.setCursor(0,1); lcd.print("                ");
+    return;
+  }
+
+  int slot = circSlotForCursor(inboxCursor);
+  if(slot < 0){
+    lcd.setCursor(0,0); lcd.print("No msgs         ");
+    lcd.setCursor(0,1); lcd.print("                ");
+    return;
+  }
+
+  Message m = msgBuf[slot];
+
+  // When in INBOX, we display a left marker '>' and reduce sender width by 1
+  bool showMarker = (state == INBOX);
+  int senderWidth = SENDER_WIDTH;
+  if(showMarker) senderWidth = max(1, SENDER_WIDTH - 1); // keep at least 1 char
+
+  int contentWidth = LCD_COLS - (showMarker ? 1 : 0) - senderWidth;
+  if(contentWidth < 1) contentWidth = 1;
+
+  // prepare sender column
+  String sender = m.sender;
+  if(sender.length() < senderWidth) while(sender.length() < senderWidth) sender += ' ';
+  else if(sender.length() > senderWidth) sender = sender.substring(0, senderWidth);
+
+  // body to display / scroll
+  String body = m.body;
+
+  // draw marker if needed
+  if(showMarker){
+    lcd.setCursor(0,0);
+    lcd.print('>');
+    lcd.setCursor(1,0);
+  } else {
+    lcd.setCursor(0,0);
+  }
+
+  // If body fits in visible area -> print single view on top and bottom (top=sender+body truncated)
+  if(body.length() <= contentWidth){
+    String topLine = sender + body;
+    // pad to full width remaining
+    while(topLine.length() < LCD_COLS - (showMarker ? 1 : 0)) topLine += ' ';
+    // write top (marker was already placed if any)
+    if(showMarker){
+      lcd.setCursor(1,0); lcd.print(topLine);
+    } else {
+      lcd.setCursor(0,0); lcd.print(topLine);
+    }
+    // bottom row: repeat body (trim/pad) so user sees two lines
+    String bottomLine = body;
+    if(bottomLine.length() > LCD_COLS) bottomLine = bottomLine.substring(0, LCD_COLS);
+    lcd.setCursor(0,1); lcd.print(bottomLine);
+    return;
+  }
+
+  // body longer than contentWidth -> do marquee scroll
+  // initial display: sender + first contentWidth chars
+  String initial = sender + body.substring(0, contentWidth);
+  if(showMarker){
+    // marker occupies col0, so print at col1
+    lcd.setCursor(1,0); lcd.print(initial);
+  } else {
+    lcd.setCursor(0,0); lcd.print(initial);
+  }
+
+  // bottom row initially shows next slice (or remaining beginning) so user sees context
+  String bottomInitial = body.substring(0, min((int)body.length(), LCD_COLS));
+  lcd.setCursor(0,1); lcd.print(bottomInitial);
+
+  // Pause before scrolling — allow keypress to interrupt
+  unsigned long t0 = millis();
+  while(millis() - t0 < MARQUEE_PAUSE_MS){
+    if(keypad.getKey()) return; // user interaction aborts scrolling
+    delay(10);
+  }
+
+  int totalSteps = body.length() - contentWidth + 1;
+  for(int pos = 0; pos < totalSteps; ++pos){
+    if(keypad.getKey()) return;
+    String topSlice = sender + body.substring(pos, pos + contentWidth);
+    if(showMarker) { lcd.setCursor(1,0); lcd.print(topSlice); }
+    else { lcd.setCursor(0,0); lcd.print(topSlice); }
+
+    // update bottom line too so user sees continuous text (optional)
+    String bottomSlice = body.substring(pos, min((int)body.length(), pos + LCD_COLS));
+    lcd.setCursor(0,1); lcd.print(bottomSlice);
+
+    unsigned long t1 = millis();
+    while(millis() - t1 < MARQUEE_STEP_MS){
+      if(keypad.getKey()) return;
+      delay(10);
+    }
+  }
+
+  // short hold at end
+  unsigned long hold = millis();
+  while(millis() - hold < 800){
+    if(keypad.getKey()) return;
+    delay(10);
+  }
+}
+
+// ---------- Compose bottom row ----------
+void drawComposeBottom(){
+  // top row should already show sender/context (caller usually called drawTopRowMarqueeForCursor earlier)
+  lcd.setCursor(0,1);
+  if(composeBuf.length() < LCD_COLS) composeVisibleStart = 0;
+  else if(composeVisibleStart > (int)composeBuf.length() - LCD_COLS) composeVisibleStart = composeBuf.length() - LCD_COLS;
+  String vis = composeBuf.substring(composeVisibleStart, min((int)composeBuf.length(), composeVisibleStart + LCD_COLS));
+  lcd.print("                ");
+  lcd.setCursor(0,1);
+  if(!multiTapActive){
+    if(vis.length() < LCD_COLS){ lcd.print(vis); lcd.print('_'); }
+    else { lcd.print(vis.substring(0, LCD_COLS - 1)); lcd.print('_'); }
+  } else {
+    lcd.print(vis);
+    if(vis.length() < LCD_COLS) lcd.print('_');
+  }
+}
+
+// ---------- MQTT diagnostics & callback ----------
+const char* mqttStateName(int s){
+  switch(s){
+    case -4: return "MQTT_CONNECTION_TIMEOUT";
+    case -3: return "MQTT_CONNECTION_LOST";
+    case -2: return "MQTT_CONNECT_FAILED";
+    case -1: return "MQTT_DISCONNECTED";
+    case 0:  return "MQTT_CONNECTED";
+    case 1:  return "MQTT_BAD_PROTOCOL";
+    case 2:  return "MQTT_BAD_CLIENT_ID";
+    case 3:  return "MQTT_UNAVAILABLE";
+    case 4:  return "MQTT_BAD_CREDENTIALS";
+    case 5:  return "MQTT_UNAUTHORIZED";
+    default: return "MQTT_UNKNOWN";
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length){
+  String s;
+  for(unsigned int i=0;i<length;i++) s += (char)payload[i];
+  Message m; m.sender = "[remote]"; m.body = s; m.ts = nowTimestamp(); m.unread = true;
+  if(s.startsWith("[")){
+    int p = s.indexOf(']');
+    if(p > 0){ m.sender = s.substring(0,p+1); m.body = s.substring(p+1); }
+  }
+  storeMessageRAM(m);
+  digitalWrite(LED_NOTIF, HIGH); playBuzzerPattern(0); delay(80); digitalWrite(LED_NOTIF, LOW);
+  // update screen depending on where we are
+  if(state == HOME) drawHome();
+  else if(state == INBOX) { drawTopRowMarqueeForCursor(); } // will clear and redraw both rows
+}
+
+void mqttReconnect(){
+  if(mqttClient.connected()) return;
+  if(mqttBroker.length() == 0) return;
+  Serial.print("MQTT connecting to "); Serial.print(mqttBroker); Serial.print(':'); Serial.println(mqttPort);
+  bool ok;
+  if(String(DEFAULT_MUSER).length() && String(DEFAULT_MPASS).length()){
+    ok = mqttClient.connect(deviceName.c_str(), DEFAULT_MUSER, DEFAULT_MPASS);
+  } else {
+    ok = mqttClient.connect(deviceName.c_str());
+  }
+  if(ok){
+    Serial.println("MQTT connected."); mqttClient.subscribe(mqttTopic.c_str()); digitalWrite(LED_CONN, HIGH);
+  } else {
+    int st = mqttClient.state();
+    Serial.print("MQTT connect failed, state="); Serial.print(st); Serial.print(" ("); Serial.print(mqttStateName(st)); Serial.println(")");
+    digitalWrite(LED_CONN, LOW);
+  }
+}
+
+// ---------- Compose & send ----------
+void enterCompose(){
+  // clear display, keep top context (sender line) then show compose at bottom
+  lcd.clear();
+  drawTopRowMarqueeForCursor(); // ensures top row shows context
+  composeBuf = "";
+  composeVisibleStart = 0;
+  multiTapActive = false;
+  lastKey = 0;
+  drawComposeBottom();
+  state = COMPOSE;
+}
+
+void sendCompose(){
+  if(composeBuf.length() == 0){
+    lcd.setCursor(0,1); lcd.print("Empty - C to cancel"); delay(500); drawComposeBottom(); return;
+  }
+  String payload = "[" + deviceName + "]" + composeBuf;
+  if(mqttClient.connected()){
+    bool ok = mqttClient.publish(mqttTopic.c_str(), payload.c_str());
+    if(ok){
+      digitalWrite(LED_NOTIF, HIGH); playBuzzerPattern(1); delay(60); digitalWrite(LED_NOTIF, LOW);
+      Message m; m.sender = "[" + deviceName + "]"; m.body = composeBuf; m.ts = nowTimestamp(); m.unread = false;
+      storeMessageRAM(m);
+    } else {
+      digitalWrite(LED_ERR, HIGH); playBuzzerPattern(2); delay(200); digitalWrite(LED_ERR, LOW);
+      Serial.println("MQTT publish failed");
+    }
+  } else {
+    digitalWrite(LED_ERR, HIGH); playBuzzerPattern(2); delay(200); digitalWrite(LED_ERR, LOW);
+    Serial.println("MQTT not connected; cannot publish");
+  }
+  composeBuf = ""; multiTapActive = false; state = HOME; drawHome();
+}
+
+// ---------- Key handling (menu waits and clears) ----------
+void handleKeySimple(char k){
+  if(k == 'C'){ composeBuf=""; multiTapActive=false; drawHome(); return; }
+
+  if(k == '#'){
+    // menu — show, wait for 5s for numeric selection
+    lcd.clear();
+    lcd.setCursor(0,0); lcd.print("1:Inbox  2:Compose");
+    lcd.setCursor(0,1); lcd.print("3:Resvd  4:Clear");
+    unsigned long start = millis();
+    char sel = 0;
+    while(millis() - start < 5000){
+      char kk = keypad.getKey();
+      if(kk){ sel = kk; break; }
+      delay(10);
+    }
+    // handle selection
+    if(sel == '1'){ // Inbox
+      state = INBOX;
+      lcd.clear(); // ensure menu erased
+      drawTopRowMarqueeForCursor();
+      return;
+    } else if(sel == '2'){ // Compose
+      lcd.clear();
+      enterCompose();
+      return;
+    } else if(sel == '4'){ // Clear (confirm)
+      lcd.clear(); lcd.setCursor(0,0); lcd.print("Confirm clear?");
+      lcd.setCursor(0,1); lcd.print("Press 4 to OK");
+      unsigned long t0 = millis(); char kk = 0;
+      while(millis() - t0 < 3000){
+        char k2 = keypad.getKey();
+        if(k2 == '4'){ kk = k2; break; }
+        delay(10);
+      }
+      if(kk == '4'){
+        for(int i=0;i<MAX_MESSAGES;i++){ msgBuf[i].sender=""; msgBuf[i].body=""; msgBuf[i].ts=""; msgBuf[i].unread=false; }
+        msgHead = 0; msgCount = 0; inboxCursor = 0;
+        lcd.clear(); lcd.setCursor(0,0); lcd.print("Cleared msgs"); delay(700); drawHome(); return;
+      } else { drawHome(); return; }
+    } else { drawHome(); return; }
+  }
+
+  // HOME
+  if(state == HOME){
+    if(k == '1'){ state = INBOX; lcd.clear(); drawTopRowMarqueeForCursor(); return; }
+    else if(k == '2'){ lcd.clear(); enterCompose(); return; }
+    else if(k == '4'){ // quick clear: require double-press within 3s
+      lcd.clear(); lcd.setCursor(0,0); lcd.print("Press 4 again to");
+      lcd.setCursor(0,1); lcd.print("confirm CLEAR");
+      unsigned long t0 = millis(); bool ok=false;
+      while(millis() - t0 < 3000){
+        char k2 = keypad.getKey();
+        if(k2 == '4'){ ok = true; break; }
+        delay(10);
+      }
+      if(ok){
+        for(int i=0;i<MAX_MESSAGES;i++){ msgBuf[i].sender=""; msgBuf[i].body=""; msgBuf[i].ts=""; msgBuf[i].unread=false; }
+        msgHead = 0; msgCount = 0; inboxCursor = 0;
+        lcd.clear(); lcd.setCursor(0,0); lcd.print("Cleared msgs"); delay(600); drawHome(); return;
+      } else { drawHome(); return; }
+    }
+    return;
+  }
+
+  // INBOX
+  if(state == INBOX){
+    if(k == 'A'){ if(inboxCursor < msgCount - 1) inboxCursor++; drawTopRowMarqueeForCursor(); return; }
+    else if(k == 'B'){ if(inboxCursor > 0) inboxCursor--; drawTopRowMarqueeForCursor(); return; }
+    else if(k == 'D'){ lcd.clear(); enterCompose(); return; }
+    else if(k >= '0' && k <= '9'){ int n = k - '0'; if(n > 0 && n <= msgCount){ inboxCursor = n - 1; drawTopRowMarqueeForCursor(); } return; }
+    return;
+  }
+
+  // COMPOSE
+  if(state == COMPOSE){
+    if(k == '*'){ if(composeBuf.length() > 0) composeBuf.remove(composeBuf.length()-1); if(composeBuf.length() <= LCD_COLS) composeVisibleStart = 0; drawComposeBottom(); multiTapActive = false; lastKey = 0; return; }
+    if(k == 'D'){ if(multiTapActive) commitMultiTapChar(); sendCompose(); return; }
+    if(k >= '0' && k <= '9'){ handleMultiTapKey(k); return; }
+    if(k == '#'){ handleMultiTapKey('#'); return; }
+    return;
+  }
+}
+
+// ---------- Periodic tasks ----------
+void periodicTasks(){
+  checkMultiTapTimeout();
+
+  if(millis() - lastWifiCheck >= WIFI_CHECK_MS){
+    lastWifiCheck = millis();
+    bool wifiNow = (WiFi.status() == WL_CONNECTED);
+    if(wifiNow != lastWifiConnected){
+      lastWifiConnected = wifiNow;
+      if(wifiNow) { digitalWrite(LED_CONN, HIGH); Serial.println("WiFi connected: " + WiFi.localIP().toString()); }
+      else { digitalWrite(LED_CONN, LOW); Serial.println("WiFi disconnected"); }
+      if(state == HOME) drawHome();
+    }
+    if(wifiNow && !mqttClient.connected()) mqttReconnect();
+  }
+
+  if(mqttClient.connected()) mqttClient.loop();
+
+  bool mqttNow = mqttClient.connected();
+  if(mqttNow != lastMqttConnected){
+    lastMqttConnected = mqttNow;
+    if(state == HOME) drawHome();
+  }
+}
+
+// ---------- Setup & loop ----------
+void setup(){
+  Serial.begin(115200);
+  delay(50);
+
+  mqttBroker = String(DEFAULT_BROKER);
+  mqttPort = DEFAULT_PORT;
+  mqttTopic = String(DEFAULT_TOPIC);
+  deviceName = String(DEFAULT_DNAME);
+
+  Wire.begin();
+  lcd.init(); lcd.backlight();
+
+  pinMode(LED_CONN, OUTPUT); pinMode(LED_ERR, OUTPUT); pinMode(LED_NOTIF, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(LED_CONN, LOW); digitalWrite(LED_ERR, LOW); digitalWrite(LED_NOTIF, LOW);
+
+  // WiFi
+  Serial.println("Connecting to WiFi: " + String(DEFAULT_SSID));
+  lcd.clear(); lcd.setCursor(0,0); lcd.print("Hi " + deviceName + "!"); lcd.setCursor(0,1); lcd.print("Connecting WiFi");
+  WiFi.persistent(false); WiFi.mode(WIFI_STA); WiFi.begin(DEFAULT_SSID, DEFAULT_WPASS);
+  unsigned long st = millis();
+  const unsigned long WIFI_BOOT_TIMEOUT = 10000UL;
+  while(WiFi.status() != WL_CONNECTED && millis() - st < WIFI_BOOT_TIMEOUT){
+    lcd.setCursor(15,1); lcd.print('.');
+    delay(400);
+  }
+  if(WiFi.status() == WL_CONNECTED){
+    Serial.println("WiFi OK: " + WiFi.localIP().toString());
+    digitalWrite(LED_CONN, HIGH);
+    lcd.clear(); lcd.setCursor(0,0); lcd.print("WiFi: OK");
+  } else {
+    Serial.println("WiFi failed");
+    digitalWrite(LED_CONN, LOW);
+    lcd.clear(); lcd.setCursor(0,0); lcd.print("WiFi: --");
+  }
+  delay(700);
+
+  // MQTT client setup
+  if(USE_TLS){
+    secureClient.setInsecure(); // quick-test: skip cert verification
+    mqttClient.setClient(secureClient);
+    Serial.println("Using TLS (insecure)");
+  } else {
+    mqttClient.setClient(plainClient);
+    Serial.println("Using plain client");
+  }
+  mqttClient.setServer(mqttBroker.c_str(), mqttPort);
+  mqttClient.setCallback(mqttCallback);
+
+  if(WiFi.status() == WL_CONNECTED && mqttBroker.length() > 0) mqttReconnect();
+
+  lastWifiConnected = (WiFi.status() == WL_CONNECTED);
+  lastMqttConnected = mqttClient.connected();
+  drawHome();
+}
+
+void loop(){
+  char k = keypad.getKey();
+  if(k) handleKeySimple(k);
+  periodicTasks();
+  delay(5);
+}
