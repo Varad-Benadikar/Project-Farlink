@@ -1,0 +1,80 @@
+/* ESP32 MQTT TLS subscribe test
+   - Subscribe to topic "pager/A/incoming"
+   - Print any incoming message to Serial Monitor
+   Edit SSID, PASS, MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS
+*/
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
+const char* ssid       = "WIFI_SSID";
+const char* wifi_pass  = "Password";
+
+const char* MQTT_HOST  = "BROKER_LINK"; // hiveMQ host (no https://)
+const uint16_t MQTT_PORT = 8883;                            // TLS port for device clients
+const char* MQTT_USER  = "USERNAME";                          // your MQTT username
+const char* MQTT_PASS  = "PASSWORD";
+
+WiFiClientSecure secureClient;
+PubSubClient mqtt(secureClient);
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("[IN] Topic: ");
+  Serial.println(topic);
+  Serial.print("[IN] Message: ");
+  for (unsigned int i = 0; i < length; i++) Serial.print((char)payload[i]);
+  Serial.println();
+}
+
+void setupWiFi() {
+  Serial.print("WiFi connecting");
+  WiFi.begin(ssid, wifi_pass);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 30000UL) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi OK — IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi FAILED (check credentials)");
+  }
+}
+
+void reconnect() {
+  while (!mqtt.connected()) {
+    Serial.print("MQTT connecting...");
+    // NOTE: setInsecure() — accepts any cert (ONLY for quick testing)
+    secureClient.setInsecure();
+    if (mqtt.connect("ESP32-pager-A", MQTT_USER, MQTT_PASS)) {
+      Serial.println("connected");
+      mqtt.subscribe("pager/test"); // subscribe to test topic
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqtt.state());
+      Serial.println(" - retrying in 3s");
+      delay(3000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  setupWiFi();
+
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(callback);
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    // try reconnecting Wi-Fi quickly (non-blocking could be improved)
+    setupWiFi();
+  }
+  if (!mqtt.connected()) reconnect();
+  mqtt.loop();
+}
